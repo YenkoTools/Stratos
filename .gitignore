@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+client/dist/
+server/wwwroot/
+
+# .NET
+server/bin/
+server/obj/
+
+# Secrets / encrypted data
+*.dat
+
+# Environment-specific appsettings (keep base appsettings.json)
+appsettings.Development.json
+appsettings.Production.json
+appsettings.*.json
+!appsettings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.user

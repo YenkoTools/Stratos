@@ -1,0 +1,40 @@
+---
+import EnvironmentSwitcher from '../components/EnvironmentSwitcher';
+
+interface Props {
+  title?: string;
+}
+
+const { title = 'Stratos' } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  </head>
+  <body class="min-h-screen bg-gray-50 text-gray-900 antialiased">
+
+    <!-- Top navigation bar -->
+    <header class="bg-white border-b border-gray-200 shadow-sm sticky top-0 z-50">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between">
+        <div class="flex items-center gap-3">
+          <span class="font-semibold text-lg tracking-tight">Stratos</span>
+        </div>
+        <div class="flex items-center gap-4">
+          <span class="text-xs text-gray-400 uppercase tracking-wide font-medium">Environment</span>
+          <EnvironmentSwitcher client:load />
+        </div>
+      </div>
+    </header>
+
+    <!-- Page content -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <slot />
+    </main>
+
+  </body>
+</html>
