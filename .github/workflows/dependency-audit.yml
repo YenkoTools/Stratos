@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  issues: write
+  contents: write # required to push to the wiki
 
 jobs:
   audit-npm:
@@ -52,7 +51,7 @@ jobs:
               "| Package | Severity | Via | Fix Available |",
               "|---------|----------|-----|---------------|",
               (.vulnerabilities // {} | to_entries[] |
-                "| \(.key) | \(.value.severity) | \([.value.via[] | if type == "string" then . else .name // "indirect" end] | join(", ")) | \(if .value.fixAvailable == true then "Yes" elif .value.fixAvailable == false then "No" else "Break Change" end) |"
+                "| \(.key) | \(.value.severity) | \([.value.via[] | if type == "string" then . else .name // "indirect" end] | join(", ")) | \(if .value.fixAvailable == true then "Yes" elif .value.fixAvailable == false then "No" else "Breaking Change" end) |"
               )' 2>/dev/null || echo "Unable to parse vulnerability details.")
           fi
 
@@ -119,15 +118,14 @@ jobs:
           if echo "$VULN_OUTPUT" | grep -q "no vulnerable packages"; then
             VULN_TABLE="No vulnerable packages found."
           else
-            # Parse the dotnet CLI tabular output into markdown
             VULN_TABLE=$(echo "$VULN_OUTPUT" | awk '
-              /^   >/ {
-                pkg = $2; ver = $3; sev = $4; url = $5
-                print "| " pkg " | " ver " | " sev " | " url " |"
-              }
               BEGIN {
                 print "| Package | Resolved Version | Severity | Advisory URL |"
                 print "|---------|-----------------|----------|--------------|"
+              }
+              /^   >/ {
+                pkg = $2; ver = $3; sev = $4; url = $5
+                print "| " pkg " | " ver " | " sev " | " url " |"
               }
             ')
           fi
@@ -150,13 +148,13 @@ jobs:
             OUTDATED_TABLE="All packages are up to date."
           else
             OUTDATED_TABLE=$(echo "$OUTDATED_OUTPUT" | awk '
-              /^   >/ {
-                pkg = $2; resolved = $3; latest = $4
-                print "| " pkg " | " resolved " | " latest " |"
-              }
               BEGIN {
                 print "| Package | Resolved | Latest |"
                 print "|---------|----------|--------|"
+              }
+              /^   >/ {
+                pkg = $2; resolved = $3; latest = $4
+                print "| " pkg " | " resolved " | " latest " |"
               }
             ')
           fi
@@ -168,85 +166,106 @@ jobs:
           echo "EOF" >> $GITHUB_OUTPUT
 
   publish-report:
-    name: Publish Report
+    name: Publish Report to Wiki
     runs-on: ubuntu-latest
     needs: [audit-npm, audit-dotnet]
     if: always()
     steps:
       - name: Build markdown report
-        id: build
         env:
           NPM_VULN: ${{ needs.audit-npm.outputs.vulnerability_report }}
           NPM_OUTDATED: ${{ needs.audit-npm.outputs.outdated_report }}
           DOTNET_VULN: ${{ needs.audit-dotnet.outputs.vulnerability_report }}
           DOTNET_OUTDATED: ${{ needs.audit-dotnet.outputs.outdated_report }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          REPORT_DATE: ${{ github.event.repository.updated_at }}
         run: |
-          DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+          DATE=$(date -u '+%Y-%m-%d')
+          DATETIME=$(date -u '+%Y-%m-%d %H:%M UTC')
 
-          cat > report.md <<MDEOF
-          # Dependency Audit Report
+          # Dated wiki page filename (spaces become hyphens in wiki URLs)
+          PAGE_FILE="Dependency-Audit-${DATE}.md"
+          echo "PAGE_FILE=$PAGE_FILE" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
 
-          **Date:** $DATE
-          **Run:** $RUN_URL
+          cat > "$PAGE_FILE" <<MDEOF
+          # Dependency Audit — ${DATETIME}
+
+          **Workflow run:** [View on GitHub Actions](${RUN_URL})
 
           ---
 
           ## Astro Client (npm)
 
-          $NPM_VULN
+          ${NPM_VULN}
 
-          $NPM_OUTDATED
+          ${NPM_OUTDATED}
 
           ---
 
           ## .NET Server
 
-          $DOTNET_VULN
+          ${DOTNET_VULN}
 
-          $DOTNET_OUTDATED
+          ${DOTNET_OUTDATED}
+
+          ---
+
+          _[Back to audit index](Dependency-Audits)_
           MDEOF
 
-          echo "Generated report:"
-          cat report.md
+      - name: Clone wiki
+        run: |
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki
+          git -C wiki config user.name "github-actions[bot]"
+          git -C wiki config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Upload report as artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-audit-report
-          path: report.md
-          retention-days: 90
+      - name: Write dated report page
+        run: cp "$PAGE_FILE" "wiki/$PAGE_FILE"
 
-      - name: Post report as GitHub issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('report.md', 'utf8');
-            const date = new Date().toISOString().split('T')[0];
-            const title = `Dependency Audit Report — ${date}`;
+      - name: Update audit index page
+        run: |
+          INDEX="wiki/Dependency-Audits.md"
 
-            // Close previous audit issues to avoid accumulation
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              labels: ['dependency-audit'],
-              state: 'open',
-            });
-            for (const issue of issues) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: issue.number,
-                state: 'closed',
-              });
-            }
+          # Build a sorted list of all existing audit pages (newest first)
+          LINKS=$(ls wiki/Dependency-Audit-*.md 2>/dev/null | sort -r | while read f; do
+            base=$(basename "$f" .md)
+            date_part=${base#Dependency-Audit-}
+            echo "- [${date_part}](${base})"
+          done)
 
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title,
-              body: report,
-              labels: ['dependency-audit'],
-            });
+          cat > "$INDEX" <<IDXEOF
+          # Dependency Audit Reports
+
+          All audit runs, newest first. Each report covers npm (Astro client) and .NET (server) packages.
+
+          ${LINKS}
+          IDXEOF
+
+      - name: Update wiki sidebar
+        run: |
+          SIDEBAR="wiki/_Sidebar.md"
+
+          # Collect the 10 most recent audit entries for the sidebar
+          RECENT=$(ls wiki/Dependency-Audit-*.md 2>/dev/null | sort -r | head -10 | while read f; do
+            base=$(basename "$f" .md)
+            date_part=${base#Dependency-Audit-}
+            echo "- [${date_part}](${base})"
+          done)
+
+          cat > "$SIDEBAR" <<SEOF
+          ## Dependency Audits
+
+          [All reports](Dependency-Audits)
+
+          **Recent runs:**
+
+          ${RECENT}
+          SEOF
+
+      - name: Commit and push to wiki
+        run: |
+          cd wiki
+          git add .
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m "chore: dependency audit report ${DATE}"
+          git push
