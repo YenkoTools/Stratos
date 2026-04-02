@@ -1,0 +1,252 @@
+name: Dependency Audit
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Every Monday at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  audit-npm:
+    name: Audit npm (Astro client)
+    runs-on: ubuntu-latest
+    outputs:
+      vulnerability_report: ${{ steps.vuln.outputs.report }}
+      outdated_report: ${{ steps.outdated.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: "npm"
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dependencies
+        working-directory: client
+        run: npm ci --prefer-offline || npm install
+
+      - name: npm audit (vulnerabilities)
+        id: vuln
+        working-directory: client
+        run: |
+          set +e
+          AUDIT_OUTPUT=$(npm audit --json 2>/dev/null)
+          EXIT_CODE=$?
+          set -e
+
+          VULN_COUNT=$(echo "$AUDIT_OUTPUT" | jq '.metadata.vulnerabilities | (.critical + .high + .moderate + .low + .info)' 2>/dev/null || echo "0")
+          CRITICAL=$(echo "$AUDIT_OUTPUT" | jq '.metadata.vulnerabilities.critical' 2>/dev/null || echo "0")
+          HIGH=$(echo "$AUDIT_OUTPUT" | jq '.metadata.vulnerabilities.high' 2>/dev/null || echo "0")
+          MODERATE=$(echo "$AUDIT_OUTPUT" | jq '.metadata.vulnerabilities.moderate' 2>/dev/null || echo "0")
+          LOW=$(echo "$AUDIT_OUTPUT" | jq '.metadata.vulnerabilities.low' 2>/dev/null || echo "0")
+
+          if [ "$VULN_COUNT" -eq "0" ]; then
+            VULN_TABLE="No vulnerabilities found."
+          else
+            VULN_TABLE=$(echo "$AUDIT_OUTPUT" | jq -r '
+              "| Package | Severity | Via | Fix Available |",
+              "|---------|----------|-----|---------------|",
+              (.vulnerabilities // {} | to_entries[] |
+                "| \(.key) | \(.value.severity) | \([.value.via[] | if type == "string" then . else .name // "indirect" end] | join(", ")) | \(if .value.fixAvailable == true then "Yes" elif .value.fixAvailable == false then "No" else "Break Change" end) |"
+              )' 2>/dev/null || echo "Unable to parse vulnerability details.")
+          fi
+
+          REPORT="### npm Vulnerabilities\n\n"
+          REPORT+="| Critical | High | Moderate | Low |\n"
+          REPORT+="|----------|------|----------|-----|\n"
+          REPORT+="| $CRITICAL | $HIGH | $MODERATE | $LOW |\n\n"
+          REPORT+="$VULN_TABLE"
+
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: npm outdated
+        id: outdated
+        working-directory: client
+        run: |
+          set +e
+          OUTDATED_OUTPUT=$(npm outdated --json 2>/dev/null)
+          set -e
+
+          if [ -z "$OUTDATED_OUTPUT" ] || [ "$OUTDATED_OUTPUT" = "{}" ]; then
+            OUTDATED_TABLE="All packages are up to date."
+          else
+            OUTDATED_TABLE=$(echo "$OUTDATED_OUTPUT" | jq -r '
+              "| Package | Current | Wanted | Latest |",
+              "|---------|---------|--------|--------|",
+              (to_entries[] | "| \(.key) | \(.value.current // "N/A") | \(.value.wanted // "N/A") | \(.value.latest // "N/A") |")
+            ' 2>/dev/null || echo "Unable to parse outdated package details.")
+          fi
+
+          REPORT="### npm Outdated Packages\n\n$OUTDATED_TABLE"
+
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  audit-dotnet:
+    name: Audit .NET (server)
+    runs-on: ubuntu-latest
+    outputs:
+      vulnerability_report: ${{ steps.vuln.outputs.report }}
+      outdated_report: ${{ steps.outdated.outputs.report }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.x"
+
+      - name: Restore packages
+        working-directory: server
+        run: dotnet restore
+
+      - name: dotnet list vulnerabilities
+        id: vuln
+        working-directory: server
+        run: |
+          set +e
+          VULN_OUTPUT=$(dotnet list package --vulnerable --include-transitive 2>&1)
+          set -e
+
+          if echo "$VULN_OUTPUT" | grep -q "no vulnerable packages"; then
+            VULN_TABLE="No vulnerable packages found."
+          else
+            # Parse the dotnet CLI tabular output into markdown
+            VULN_TABLE=$(echo "$VULN_OUTPUT" | awk '
+              /^   >/ {
+                pkg = $2; ver = $3; sev = $4; url = $5
+                print "| " pkg " | " ver " | " sev " | " url " |"
+              }
+              BEGIN {
+                print "| Package | Resolved Version | Severity | Advisory URL |"
+                print "|---------|-----------------|----------|--------------|"
+              }
+            ')
+          fi
+
+          REPORT="### .NET Vulnerabilities\n\n$VULN_TABLE"
+
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: dotnet list outdated
+        id: outdated
+        working-directory: server
+        run: |
+          set +e
+          OUTDATED_OUTPUT=$(dotnet list package --outdated --include-transitive 2>&1)
+          set -e
+
+          if echo "$OUTDATED_OUTPUT" | grep -q "No packages were found"; then
+            OUTDATED_TABLE="All packages are up to date."
+          else
+            OUTDATED_TABLE=$(echo "$OUTDATED_OUTPUT" | awk '
+              /^   >/ {
+                pkg = $2; resolved = $3; latest = $4
+                print "| " pkg " | " resolved " | " latest " |"
+              }
+              BEGIN {
+                print "| Package | Resolved | Latest |"
+                print "|---------|----------|--------|"
+              }
+            ')
+          fi
+
+          REPORT="### .NET Outdated Packages\n\n$OUTDATED_TABLE"
+
+          echo "report<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$REPORT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  publish-report:
+    name: Publish Report
+    runs-on: ubuntu-latest
+    needs: [audit-npm, audit-dotnet]
+    if: always()
+    steps:
+      - name: Build markdown report
+        id: build
+        env:
+          NPM_VULN: ${{ needs.audit-npm.outputs.vulnerability_report }}
+          NPM_OUTDATED: ${{ needs.audit-npm.outputs.outdated_report }}
+          DOTNET_VULN: ${{ needs.audit-dotnet.outputs.vulnerability_report }}
+          DOTNET_OUTDATED: ${{ needs.audit-dotnet.outputs.outdated_report }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_DATE: ${{ github.event.repository.updated_at }}
+        run: |
+          DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          cat > report.md <<MDEOF
+          # Dependency Audit Report
+
+          **Date:** $DATE
+          **Run:** $RUN_URL
+
+          ---
+
+          ## Astro Client (npm)
+
+          $NPM_VULN
+
+          $NPM_OUTDATED
+
+          ---
+
+          ## .NET Server
+
+          $DOTNET_VULN
+
+          $DOTNET_OUTDATED
+          MDEOF
+
+          echo "Generated report:"
+          cat report.md
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-audit-report
+          path: report.md
+          retention-days: 90
+
+      - name: Post report as GitHub issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+            const date = new Date().toISOString().split('T')[0];
+            const title = `Dependency Audit Report — ${date}`;
+
+            // Close previous audit issues to avoid accumulation
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: ['dependency-audit'],
+              state: 'open',
+            });
+            for (const issue of issues) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+              });
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body: report,
+              labels: ['dependency-audit'],
+            });
