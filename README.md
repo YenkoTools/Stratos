@@ -1,11 +1,11 @@
 # Stratos
 
-AstroJS static frontend + .NET 10 BFF (Backend for Frontend) packaged as a single self-contained Windows executable.
+AstroJS static frontend + .NET 10 BFF (Backend for Frontend) packaged as a single self-contained Linux executable.
 
 ## Architecture
 
 ```
-Browser  ──►  server.exe (Kestrel :5000)
+Browser  ──►  server (Kestrel :5000)
                 │
                 ├── GET  /            → serves Astro static output from wwwroot/
                 ├── POST /internal/environment/{env}  → switches active APIM cluster
@@ -15,7 +15,7 @@ Browser  ──►  server.exe (Kestrel :5000)
 
 - **Astro** builds a fully static site (`output: 'static'`). All data fetching is client-side via React island components calling the BFF.
 - **YARP** proxies `/api/**` requests to the APIM cluster for the currently active environment and injects the correct `Ocp-Apim-Subscription-Key` header.
-- **DPAPI** (`ProtectedData`) encrypts APIM subscription keys to `secrets.dat` on first run (Windows only). On Linux in development, keys are read directly from `appsettings.json`.
+- **Subscription keys** are read from configuration (`appsettings.json` or environment variables) on Linux. When run on Windows, the code encrypts them with DPAPI (`ProtectedData`) into `secrets.dat` instead.
 
 ---
 
@@ -37,12 +37,14 @@ dotnet run
 ```
 
 - The Astro dev server runs on `http://localhost:4321` with its own dev proxy; use it for UI iteration.
-- The BFF runs on `http://localhost:5000`; for an integrated end-to-end test, run `build.sh` and test on Windows.
-- DPAPI is disabled on Linux; APIM keys are read directly from `appsettings.json`.
+- The BFF runs on `http://localhost:5000`; for an integrated end-to-end test, run `build.sh`, then `cd dist && ./server`.
+- APIM keys are read directly from `appsettings.json`.
 
 ---
 
 ## Production Build
+
+Prerequisites: Node.js (with npm) and the .NET 10 SDK on `PATH`.
 
 ```bash
 chmod +x build.sh
@@ -50,17 +52,24 @@ chmod +x build.sh
 ```
 
 This:
-1. Runs `npm install && npm run build` in `client/` — output lands in `server/wwwroot/`
-2. Publishes the .NET BFF as a self-contained single-file Windows executable to `dist/`
+1. Deletes any previous `dist/` and `server/wwwroot/` output
+2. Runs `npm install && npm run build` in `client/`; the output goes to `server/wwwroot/`
+3. Publishes the .NET BFF as a self-contained single-file Linux executable to `dist/`
 
-Artifact: `./dist/server.exe` (~25–35 MB).
+Artifact: `./dist/server` (~120 MB). The target machine does not need the .NET runtime installed.
+
+The default target is `linux-x64`. To build for another Linux architecture, set `RID`:
+
+```bash
+RID=linux-arm64 ./build.sh
+```
 
 ---
 
-## First Run on Windows
+## Running on Linux
 
-1. Copy `server.exe` (and `appsettings.json`) to the target machine.
-2. Edit `appsettings.json` — replace the placeholder keys with real APIM subscription keys:
+1. Copy the whole `dist/` directory to the target machine. `server` needs `appsettings.json` and `wwwroot/` next to it.
+2. Edit `dist/appsettings.json` and replace the placeholder keys with real APIM subscription keys:
 
 ```json
 "Keys": {
@@ -71,17 +80,68 @@ Artifact: `./dist/server.exe` (~25–35 MB).
 }
 ```
 
-3. Run `server.exe`.
-   - On first run DPAPI encrypts the keys from `appsettings.json` into `secrets.dat` alongside the exe.
-   - On subsequent runs, keys are loaded from `secrets.dat` (plaintext values in `appsettings.json` are no longer used for key lookup).
-4. Open `http://localhost:5000` in any browser.
+3. Start the server **from inside `dist/`**. The app looks for `appsettings.json` and `wwwroot/` in the working directory:
+
+```bash
+cd dist
+./server
+```
+
+4. Open `http://localhost:5000` in a browser.
 5. Use the **DEV / QA / STAGE / PROD** buttons in the navigation bar to switch the active APIM backend.
+
+### Securing the keys
+
+DPAPI is Windows-only, so on Linux the keys are read in plain text from `appsettings.json` on every request and `secrets.dat` is never created. Restrict access to the file:
+
+```bash
+chmod 600 dist/appsettings.json
+```
+
+You can also leave the keys out of the file and supply them as environment variables. .NET maps `__` to `:`:
+
+```bash
+export Apim__Keys__dev="your-real-dev-key"
+export Apim__Keys__prod="your-real-prod-key"
+./server
+```
 
 ### Rotating keys
 
-1. Update `appsettings.json` with new key values.
-2. Delete `secrets.dat`.
-3. Restart `server.exe` — DPAPI will re-encrypt the updated keys on startup.
+Update the values in `appsettings.json` (or the environment variables), then restart `server`.
+
+### Listening address
+
+By default Kestrel binds to `http://127.0.0.1:5000` (see `Kestrel:Endpoints:Http:Url` in `appsettings.json`), so only the local machine can reach it. To accept connections from other machines, change the URL to `http://0.0.0.0:5000`. You can also override it at startup:
+
+```bash
+Kestrel__Endpoints__Http__Url=http://0.0.0.0:5000 ./server
+```
+
+### Running as a systemd service (optional)
+
+```ini
+# /etc/systemd/system/stratos.service
+[Unit]
+Description=Stratos BFF
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/stratos
+ExecStart=/opt/stratos/server
+Restart=on-failure
+User=stratos
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now stratos
+```
+
+`WorkingDirectory` must be the directory that contains `server`, `appsettings.json` and `wwwroot/`.
 
 ---
 
